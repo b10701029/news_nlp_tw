@@ -60,14 +60,17 @@ def run(date_str: str | None = None) -> None:
         is_new = store_event(event)
 
         if is_new and event.get("magnitude", 0) >= NOTIFY_MAGNITUDE_THRESHOLD:
+            event["company_name"] = ann.get("company_name", ticker)
             high_magnitude.append(event)
-            log.info("High-magnitude event: %s %s", ticker, event.get("summary_zh"))
+            log.info("High-magnitude event: %s %s %s", ticker, event.get("company_name"), event.get("summary_zh"))
 
     if high_magnitude:
         lines = ["📰 台股重大訊息摘要", "━━━━━━━━━━━━━━━━━━"]
         for e in high_magnitude[:5]:
             icon = "🟢" if e["sentiment"] == "positive" else "🔴" if e["sentiment"] == "negative" else "⚪"
-            lines.append(f"{icon} {e['ticker']} [{e['event_type']}] 強度:{e['magnitude']}")
+            co = e.get("company_name", e["ticker"])
+            label = f"{e['ticker']} {co}" if co != e["ticker"] else e["ticker"]
+            lines.append(f"{icon} {label} [{e['event_type']}] 強度:{e['magnitude']}")
             lines.append(f"   {e.get('summary_zh', '')}")
         send_telegram("\n".join(lines))
 
