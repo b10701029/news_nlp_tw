@@ -1,0 +1,85 @@
+"""news_nlp_tw — Taiwan MOPS event extraction and notification.
+
+Fetches daily MOPS major announcements, extracts events via Claude API,
+and notifies Telegram for high-magnitude events.
+
+Usage:
+  python3 main.py [--date YYYY-MM-DD]
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import requests
+from datetime import datetime, timezone
+
+from config import TG_BOT_TOKEN, TG_CHAT_ID, NOTIFY_MAGNITUDE_THRESHOLD
+from mops_fetcher import fetch_mops_announcements
+from extractor import extract_event, sentiment_to_score
+from event_store import store_event
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+
+def send_telegram(text: str) -> bool:
+    if not TG_BOT_TOKEN:
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": text},
+            timeout=10,
+        )
+        return r.ok
+    except Exception:
+        return False
+
+
+def run(date_str: str | None = None) -> None:
+    if not date_str:
+        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+    log.info("Fetching MOPS announcements for %s", date_str)
+    announcements = fetch_mops_announcements(date_str)
+    log.info("Found %d announcements", len(announcements))
+
+    high_magnitude = []
+    for ann in announcements:
+        ticker = ann.get("ticker", "")
+        content = ann.get("title", "") + " " + ann.get("content", "")
+        if not content.strip():
+            continue
+
+        event = extract_event(ticker, content)
+        if not event:
+            continue
+
+        event["timestamp"] = ann.get("announcement_time", date_str)
+        is_new = store_event(event)
+
+        if is_new and event.get("magnitude", 0) >= NOTIFY_MAGNITUDE_THRESHOLD:
+            high_magnitude.append(event)
+            log.info("High-magnitude event: %s %s", ticker, event.get("summary_zh"))
+
+    if high_magnitude:
+        lines = ["📰 台股重大訊息摘要", "━━━━━━━━━━━━━━━━━━"]
+        for e in high_magnitude[:5]:
+            icon = "🟢" if e["sentiment"] == "positive" else "🔴" if e["sentiment"] == "negative" else "⚪"
+            lines.append(f"{icon} {e['ticker']} [{e['event_type']}] 強度:{e['magnitude']}")
+            lines.append(f"   {e.get('summary_zh', '')}")
+        send_telegram("\n".join(lines))
+
+    log.info("Done. %d high-magnitude events notified.", len(high_magnitude))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--date", help="Date YYYYMMDD (default: today)")
+    args = parser.parse_args()
+    run(args.date)
+
+
+if __name__ == "__main__":
+    main()
