@@ -48,8 +48,16 @@ def run(date_str: str | None = None) -> None:
     high_magnitude = []
     for ann in announcements:
         ticker = ann.get("ticker", "")
-        content = ann.get("title", "") + " " + ann.get("content", "")
-        if not content.strip():
+        title = ann.get("announcement_title", "")
+        body = ""
+        if ann.get("content_url"):
+            try:
+                from mops_fetcher import fetch_announcement_content
+                body = fetch_announcement_content(ann["content_url"])
+            except Exception:
+                pass
+        content = (title + " " + body).strip()
+        if not content:
             continue
 
         event = extract_event(ticker, content)
