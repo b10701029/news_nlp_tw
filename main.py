@@ -9,15 +9,35 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import time
 import requests
 from datetime import datetime, timezone
 
-from config import TG_BOT_TOKEN, TG_CHAT_ID, NOTIFY_MAGNITUDE_THRESHOLD
+from config import TG_BOT_TOKEN, TG_CHAT_ID, NOTIFY_MAGNITUDE_THRESHOLD, DATA_DIR
 from mops_fetcher import fetch_mops_announcements
 from extractor import extract_event, sentiment_to_score
 from event_store import store_event
+
+_SCORES_LOG = os.path.join(DATA_DIR, "scores.jsonl")
+
+
+def _append_score_log(ticker: str, score: float) -> None:
+    """Append a signed sentiment score to scores.jsonl for Spearman IC tracking."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        rec = {
+            "ticker": ticker,
+            "ts": time.time(),
+            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "score": score,
+        }
+        with open(_SCORES_LOG, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -66,6 +86,9 @@ def run(date_str: str | None = None) -> None:
 
         event["timestamp"] = ann.get("announcement_time", date_str)
         is_new = store_event(event)
+
+        if is_new:
+            _append_score_log(ticker, sentiment_to_score(event))
 
         if is_new and event.get("magnitude", 0) >= NOTIFY_MAGNITUDE_THRESHOLD:
             event["company_name"] = ann.get("company_name", ticker)

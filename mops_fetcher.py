@@ -19,7 +19,6 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlencode
 
 import requests
 from bs4 import BeautifulSoup
@@ -32,6 +31,14 @@ logger = logging.getLogger(__name__)
 
 _MOPS_BASE = "https://mops.twse.com.tw"
 _MOPS_API = f"{_MOPS_BASE}/mops/web/ajax_t05st01_q1"
+
+# TWSE Open Data announcement API (stable JSON). The legacy
+# ajax_t05st01_q1 HTML table scrape no longer returns parseable rows, so the
+# list fetch now uses this endpoint. Returns a JSON array of the day's company
+# announcements (重大訊息). Fields (tolerant to casing): Date (ROC YYYMMDD),
+# Time (HHMMSS), Code, Name, Title, Content, Url.
+_TWSE_OPENAPI = "https://openapi.twse.com.tw/v1/announcement/companyann"
+
 _HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     "User-Agent": (
@@ -86,6 +93,7 @@ def _load_cache() -> None:
 def _save_cache() -> None:
     try:
         _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _cache["generated_at"] = time.time()  # freshness stamp for monitoring
         tmp = _CACHE_PATH.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(_cache, f, ensure_ascii=False, indent=2)
@@ -307,6 +315,89 @@ def _parse_mops_table(html: str, date_str: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# TWSE Open Data JSON parser
+# ---------------------------------------------------------------------------
+
+def _get_field(row: dict, *names: str) -> str:
+    """Case/variant-tolerant lookup of a field in a TWSE announcement row."""
+    lower = {k.lower(): v for k, v in row.items()}
+    for name in names:
+        if name in row and row[name] is not None:
+            return str(row[name]).strip()
+        if name.lower() in lower and lower[name.lower()] is not None:
+            return str(lower[name.lower()]).strip()
+    return ""
+
+
+def _parse_announcement_json(payload, date_str: str) -> list[dict]:
+    """Parse the TWSE Open Data company-announcement JSON array.
+
+    Each element is a dict with (casing-tolerant) keys:
+        Date  — ROC date, e.g. "1150612" or "115/06/12"
+        Time  — "HHMMSS" or "HH:MM:SS" (optional)
+        Code  — company code, e.g. "2330"
+        Name  — company name, e.g. "台積電"
+        Title — announcement subject
+        Url   — detail page link (optional)
+    """
+    if not isinstance(payload, list):
+        logger.warning(
+            "mops_fetcher: unexpected JSON shape (%s), expected list",
+            type(payload).__name__,
+        )
+        return []
+
+    announcements: list[dict] = []
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+
+        co_id = _get_field(row, "Code", "code", "co_id", "公司代號")
+        if not co_id or not co_id[0].isdigit():
+            continue
+
+        co_name = _get_field(row, "Name", "name", "公司名稱", "co_name")
+        title = _get_field(row, "Title", "title", "主旨")
+        date_field = _get_field(row, "Date", "date", "發言日期") or date_str
+        time_field = _get_field(row, "Time", "time", "發言時間")
+
+        # TWSE "Time" is often HHMMSS without separators
+        if time_field and ":" not in time_field and time_field.isdigit():
+            time_field = time_field.zfill(6)
+            time_field = f"{time_field[:2]}:{time_field[2:4]}:{time_field[4:6]}"
+
+        point_in_time_ts = _parse_mops_datetime(date_field, time_field)
+        if point_in_time_ts is None:
+            # Fallback: midnight UTC+8 of the requested date
+            dt = datetime.strptime(date_str, "%Y%m%d").replace(
+                tzinfo=timezone(timedelta(hours=8))
+            ).astimezone(timezone.utc)
+            point_in_time_ts = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        content_url = _get_field(row, "Url", "url", "連結")
+        if content_url and not content_url.startswith("http"):
+            content_url = f"{_MOPS_BASE}{content_url}"
+        if not content_url:
+            roc_y, mon, day = _to_roc_date(date_str)
+            content_url = (
+                f"{_MOPS_BASE}/mops/web/t05st01"
+                f"?encodeURIComponent=1&step=2&firstin=1&off=1"
+                f"&co_id={co_id}&year={roc_y}&month={mon}&day={day}"
+            )
+
+        announcements.append({
+            "ticker": _normalize_ticker(co_id),
+            "company_name": co_name,
+            "announcement_title": title,
+            "announcement_time": point_in_time_ts,  # UTC, point-in-time
+            "content_url": content_url,
+            "_raw_co_id": co_id,  # kept for debugging
+        })
+
+    return announcements
+
+
+# ---------------------------------------------------------------------------
 # Public API: fetch_mops_announcements
 # ---------------------------------------------------------------------------
 
@@ -336,52 +427,29 @@ def fetch_mops_announcements(date_str: str) -> list[dict]:
         logger.debug("mops_fetcher: cache hit for %s (%d items)", date_str, len(cached))
         return cached
 
-    roc_year, month, day = _to_roc_date(date_str)
+    # Fetch the day's announcements from the TWSE Open Data JSON API.
+    # The endpoint returns the full array for the current day; we request it
+    # and filter to date_str client-side (the API exposes today's data).
+    logger.info("mops_fetcher: fetching announcements for %s via TWSE Open Data", date_str)
 
-    # MOPS accepts POST with these form params
-    # Fetch both 上市 (sii) and 上櫃 (otc) in two passes, then merge.
     all_announcements: list[dict] = []
-
-    for market_type in ("sii", "otc"):
-        post_data = urlencode({
-            "encodeURIComponent": "1",
-            "step": "1",
-            "firstin": "1",
-            "off": "1",
-            "keyword4": "",
-            "code1": "",
-            "TYPEK": market_type,
-            "co_id": "",
-            "year": roc_year,
-            "month": month,
-            "day": day,
-        })
-
-        logger.info(
-            "mops_fetcher: fetching %s announcements for %s (ROC %s/%s/%s)",
-            market_type.upper(), date_str, roc_year, month, day,
+    try:
+        resp = _rate_limited_get(
+            f"{_TWSE_OPENAPI}?Date={date_str}", method="GET"
         )
-
         try:
-            resp = _rate_limited_get(_MOPS_API, method="POST", data=post_data)
-        except Exception as exc:
-            logger.error("mops_fetcher: failed to fetch %s for %s: %s", market_type, date_str, exc)
-            continue
+            payload = resp.json()
+        except ValueError as exc:
+            logger.warning(
+                "mops_fetcher: non-JSON response for %s: %s (body starts: %r)",
+                date_str, exc, resp.text[:120],
+            )
+            payload = []
+        all_announcements = _parse_announcement_json(payload, date_str)
+    except Exception as exc:
+        logger.error("mops_fetcher: failed to fetch %s: %s", date_str, exc)
 
-        # MOPS may send Big5; try to decode gracefully
-        try:
-            html = resp.content.decode("utf-8", errors="replace")
-        except Exception:
-            html = resp.text
-
-        items = _parse_mops_table(html, date_str)
-        logger.info(
-            "mops_fetcher: %s returned %d announcements for %s",
-            market_type.upper(), len(items), date_str,
-        )
-        all_announcements.extend(items)
-
-    # Deduplicate by (ticker, title) — same announcement may appear in sii+otc overlap
+    # Deduplicate by (ticker, title)
     seen: set[str] = set()
     deduped: list[dict] = []
     for item in all_announcements:
@@ -389,6 +457,14 @@ def fetch_mops_announcements(date_str: str) -> list[dict]:
         if key not in seen:
             seen.add(key)
             deduped.append(item)
+
+    # Row-count sanity assertion: 0 results is almost always a broken parse or
+    # an IP block, not a genuinely empty trading day — surface it loudly.
+    if len(deduped) == 0:
+        logger.warning(
+            "mops_fetcher: 0 announcements parsed for %s — possible API/parse "
+            "failure or IP block (NOT silently treating as empty)", date_str,
+        )
 
     _cache_set(cache_key, deduped)
     logger.info(
