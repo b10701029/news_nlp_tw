@@ -21,6 +21,19 @@ from mops_fetcher import fetch_mops_announcements
 from extractor import extract_event, sentiment_to_score
 from event_store import store_event
 
+_SHARED_BUS = "/home/ubuntu/shared/events.jsonl"
+
+
+def _bus_publish(event_type, payload, source):
+    try:
+        os.makedirs("/home/ubuntu/shared", exist_ok=True)
+        event = {"id": f"{event_type}_{int(time.time())}", "ts": __import__("datetime").datetime.utcnow().isoformat()+"Z", "type": event_type, "source": source, "payload": payload, "consumed_by": []}
+        with open(_SHARED_BUS, "a") as f:
+            f.write(json.dumps(event)+"\n")
+    except Exception:
+        pass
+
+
 _SCORES_LOG = os.path.join(DATA_DIR, "scores.jsonl")
 
 
@@ -104,6 +117,16 @@ def run(date_str: str | None = None) -> None:
             lines.append(f"{icon} {label} [{e['event_type']}] 強度:{e['magnitude']}")
             lines.append(f"   {e.get('summary_zh', '')}")
         send_telegram("\n".join(lines))
+
+        for event in high_magnitude:
+            if event.get("magnitude", 0) >= 6:
+                _bus_publish("mops_event_high", {
+                    "ticker": event.get("ticker") or event.get("stock_code"),
+                    "event_type": event.get("event_type", "unknown"),
+                    "sentiment": event.get("sentiment", "neutral"),
+                    "magnitude": event.get("magnitude", 0),
+                    "summary": event.get("summary_zh", "")[:100]
+                }, "news_nlp_tw")
 
     log.info("Done. %d high-magnitude events notified.", len(high_magnitude))
 
