@@ -37,8 +37,9 @@ _MOPS_API = f"{_MOPS_BASE}/mops/web/ajax_t05st01_q1"
 # list fetch now uses this endpoint. Returns a JSON array of the day's company
 # announcements (重大訊息). Fields (tolerant to casing): Date (ROC YYYMMDD),
 # Time (HHMMSS), Code, Name, Title, Content, Url.
-_TWSE_OPENAPI = "https://openapi.twse.com.tw/v1/announcement/companyann"
+_TWSE_OPENAPI = "https://openapi.twse.com.tw/v1/opendata/t187ap04_L"
 
+# Headers for MOPS HTML scrape (POST)
 _HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     "User-Agent": (
@@ -49,6 +50,17 @@ _HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
     "Referer": "https://mops.twse.com.tw/mops/web/t05st01",
+}
+
+# Headers for TWSE OpenAPI JSON endpoint (GET)
+_OPENAPI_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
 }
 
 _CACHE_PATH = Path(__file__).parent / "data" / "mops_cache.json"
@@ -131,9 +143,11 @@ def _rate_limited_get(
     method: str = "GET",
     data: Optional[dict] = None,
     timeout: int = _REQUEST_TIMEOUT,
+    headers: Optional[dict] = None,
 ) -> requests.Response:
     """Single HTTP call with 1-req/s rate limit and exponential backoff on 503."""
     global _last_request_time
+    req_headers = headers if headers is not None else _HEADERS
 
     for attempt in range(_MAX_RETRIES):
         # Enforce 1 req/second
@@ -144,10 +158,10 @@ def _rate_limited_get(
         try:
             if method == "POST":
                 resp = requests.post(
-                    url, headers=_HEADERS, data=data, timeout=timeout
+                    url, headers=req_headers, data=data, timeout=timeout
                 )
             else:
-                resp = requests.get(url, headers=_HEADERS, timeout=timeout)
+                resp = requests.get(url, headers=req_headers, timeout=timeout)
 
             _last_request_time = time.monotonic()
 
@@ -435,7 +449,7 @@ def fetch_mops_announcements(date_str: str) -> list[dict]:
     all_announcements: list[dict] = []
     try:
         resp = _rate_limited_get(
-            f"{_TWSE_OPENAPI}?Date={date_str}", method="GET"
+            _TWSE_OPENAPI, method="GET", headers=_OPENAPI_HEADERS
         )
         try:
             payload = resp.json()
@@ -463,8 +477,9 @@ def fetch_mops_announcements(date_str: str) -> list[dict]:
     if len(deduped) == 0:
         logger.warning(
             "mops_fetcher: 0 announcements parsed for %s — possible API/parse "
-            "failure or IP block (NOT silently treating as empty)", date_str,
+            "failure or IP block (NOT caching empty result to allow retry)", date_str,
         )
+        return deduped
 
     _cache_set(cache_key, deduped)
     logger.info(
